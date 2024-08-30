@@ -21,18 +21,27 @@ from datetime import datetime
 from matplotlib.figure import Figure
 from matplotlib.widgets import RectangleSelector
 from matplotlib.offsetbox import (AnnotationBbox, DrawingArea)
-from matplotlib.backends.qt_compat import (QtCore, QtWidgets, QtGui)
+#from matplotlib.backends.qt_compat import (QtCore, QtWidgets, QtGui)
+from PyQt5 import QtCore, QtWidgets, QtGui
 from matplotlib.backends.backend_qt5agg import (
     FigureCanvas, NavigationToolbar2QT as NavigationToolbar)
 
-__version__ = '1.4.3'
+__version__ = '1.5.0'
 
 mpl.use('QT5Agg')
-logging.basicConfig(level=logging.INFO)
+try: QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+except: pass
 
-QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
-QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
-QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_DontUseNativeDialogs, True)
+try: QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+except: pass
+
+try: QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_DontUseNativeDialogs, True)
+except: pass
+
+try: QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_DontUseNativeMenuBar, True)
+except: pass
+
+logging.basicConfig(level=logging.INFO)
 
 try:
     from epics import caget
@@ -62,15 +71,18 @@ frib_ftc = True
 if frib_ftc:
     from frib_device import update_pv, FSEE_KEY, FSEE_PV
     from frib_device import get_bkg_info
+    from frib_device import get_pixel_info
     extfunc = update_pv
     extkey1 = FSEE_KEY
     extbtn1 = FSEE_PV
     extbkgf = get_bkg_info
+    extpixl = get_pixel_info
 else:
     extfunc = None
     extkey1 = ''
     extbtn1 = None
     extbkgf = None
+    extpixl = None
 
 if hasattr(Image, "UnidentifiedImageError"):
     UIError = Image.UnidentifiedImageError
@@ -401,6 +413,10 @@ class ImageStorage(QtCore.QObject):
 
             elif ext == '':
                 imgout = caget(root).astype(np.uint16).astype(np.float32)
+                if len(imgout) == 0:
+                    raise ValueError('Length of "{}" is zero. Camera is supposed to be OFF.'.format(root))
+                if (extpixl is not None) and (len(imgout) != self.xsize*self.ysize):
+                    bit, self.xsize, self.ysize = extpixl(root)
                 self.im0 = imgout.reshape(self.ysize, self.xsize)
                 if self.ovrf == 'absolute':
                     self.im0 = np.abs(self.im0)
@@ -726,6 +742,8 @@ class ApplicationWindow(QtWidgets.QMainWindow):
                 self.storage.nfac   = d1['Norm. factor']
                 if 'Overflow handling' in d1:
                     self.storage.ovrf = d1['Overflow handling']
+                if 'Call external function' in d1:
+                    self.call_extfunc = d1['Call external function']
 
                 d2 = d['Fiducial']
                 self.ima.xwidth = d2['X width']
@@ -783,6 +801,8 @@ class ApplicationWindow(QtWidgets.QMainWindow):
 
                 self.ima.update_coord()
                 self.one_play()
+                if d1['X pixel'] != self.storage.xsize or d1['Y pixel'] != self.storage.ysize:
+                    Message(self, 'X-Y pixel sizes are updated automatilcally.\nRecalibation of the transformation will be required.', 'Warning')
                 self.valns_changed('t')
             except:
                 self.setWindowTitle('Viola')
@@ -798,6 +818,7 @@ class ApplicationWindow(QtWidgets.QMainWindow):
         d1['Normilized'] = self.storage.norm
         d1['Norm. factor'] = self.storage.nfac
         d1['Overflow handling'] = self.storage.ovrf
+        d1['Call external function'] = self.call_extfunc
         d1['Timestamp'] = self.storage.imtime.strftime('%Y/%m/%d %H:%M:%S')
 
         d2 = OrderedDict()
@@ -1074,8 +1095,8 @@ class ApplicationWindow(QtWidgets.QMainWindow):
         self.sldt = QtWidgets.QSlider(QtCore.Qt.Horizontal, self)
         self.sldt.setRange(0, 2**16)
         self.sldt.setValue(self.def_thrs)
-        self.sldt.sliderReleased.connect(lambda: self.sldns_changed('t', True))
-        self.sldt.valueChanged.connect(lambda: self.sldns_changed('t', False))
+        self.sldt.sliderReleased.connect(lambda: self.sldns_changed('t', False))
+        #self.sldt.valueChanged.connect(lambda: self.sldns_changed('t', False))
 
         row2 = QtWidgets.QHBoxLayout()
         txt2 = QtWidgets.QLabel('Background: ')
@@ -1088,8 +1109,8 @@ class ApplicationWindow(QtWidgets.QMainWindow):
         self.sldb = QtWidgets.QSlider(QtCore.Qt.Horizontal, self)
         self.sldb.setRange(0, 2**16)
         self.sldb.setValue(self.def_bkgr)
-        self.sldb.sliderReleased.connect(lambda: self.sldns_changed('b', True))
-        self.sldb.valueChanged.connect(lambda: self.sldns_changed('b', False))
+        self.sldb.sliderReleased.connect(lambda: self.sldns_changed('b', False))
+        #self.sldb.valueChanged.connect(lambda: self.sldns_changed('b', False))
 
         col.addLayout(row1)
         col.addWidget(self.sldt)
@@ -2121,8 +2142,7 @@ class ApplicationWindow(QtWidgets.QMainWindow):
         def open_bkgimg():
             title = 'Open Image File'
             exts = 'Images (*.png *.jpg *.tif *.tiff)'
-            filename, _ = QtWidgets.QFileDialog.getOpenFileName(
-                self.wpref, title, str(self.prev_bkg), exts)
+            filename, _ = QtWidgets.QFileDialog.getOpenFileName(self.wpref, title, str(self.prev_bkg), exts)
             if filename != '':
                 self.prev_bkg = Path(filename).absolute().parent
                 set_bkgimg(filename)

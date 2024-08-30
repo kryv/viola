@@ -4,7 +4,7 @@ from PyQt5 import QtWidgets, QtGui, QtCore
 if platform.system() == 'Windows':
     font_size = 14
 else:
-    font_size = 17
+    font_size = 16
 
 windowstyle = f"""
 * {{

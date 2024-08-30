@@ -99,3 +99,9 @@ def get_bkg_info(pv, bkg_dir):
 
     optname = '_bkg_g{}_t{}'.format(gain, expt)
     return fld, optname
+
+def get_pixel_info(pv):
+    bit = caget(pv.replace(':ArrayData', ':DataType_RBV'), timeout=0.5)
+    xsize = caget(pv.replace(':ArrayData', ':ArraySize0_RBV'), timeout=0.5)
+    ysize = caget(pv.replace(':ArrayData', ':ArraySize1_RBV'), timeout=0.5)
+    return bit, xsize, ysize

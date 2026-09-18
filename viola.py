@@ -15,6 +15,7 @@ import pickle as pk
 from scipy import ndimage
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from packaging.version import parse
 from pathlib import Path
 from PIL import Image
 from datetime import datetime
@@ -26,7 +27,7 @@ from PyQt5 import QtCore, QtWidgets, QtGui
 from matplotlib.backends.backend_qt5agg import (
     FigureCanvas, NavigationToolbar2QT as NavigationToolbar)
 
-__version__ = '1.5.0'
+__version__ = '1.5.3'
 
 mpl.use('QT5Agg')
 try: QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
@@ -49,6 +50,14 @@ except ModuleNotFoundError as e:
     logging.info('use dummy "caget" function')
     caget = lambda x: -15000*np.eye(400, dtype=np.int16).flatten()
 
+try:
+    from p4p.client.thread import Context
+    pva_ctxt = Context('pva')
+except ModuleNotFoundError as e:
+    logging.info('use dummy "pva_ctxt" function')
+    pva_ctxt = lambda x: -15000*np.eye(400, dtype=np.int16)
+
+
 use_numba = False
 if use_numba:
     try:
@@ -67,7 +76,7 @@ from misc import Message, windowstyle, menustyle
 path = os.path.dirname(os.path.abspath(__file__))
 pathl = Path(path)
 
-frib_ftc = True
+frib_ftc = False
 if frib_ftc:
     from frib_device import update_pv, FSEE_KEY, FSEE_PV
     from frib_device import get_bkg_info
@@ -257,7 +266,7 @@ class ImageAnalysis():
                     self.im1i = self.im.max()
                 self.ims.set_clim(self.im0i, self.im1i)
                 self.ims.set_cmap(self.hcmap)
-                if mpl.__version__ < '3.5':
+                if parse(mpl.__version__) < parse('3.5'):
                     self.cbr.draw_all()
                 else:
                     ax.figure.draw_without_rendering()
@@ -385,6 +394,7 @@ class ImageStorage(QtCore.QObject):
     norm = False
     nfac = 30000.0
     ovrf = 'absolute'
+    target_origin = None
     cmave = False
     cmsav = np.array([])
     cmprv = np.array([])
@@ -399,18 +409,24 @@ class ImageStorage(QtCore.QObject):
                     imgout = pk.load(f).astype(np.float32)
                     self.im0 = imgout.reshape(self.ysize, self.xsize)
             elif root[0:8] == 'https://' or root[0:7] == 'http://':
-                strm = urllib.request.urlopen(self.target)
-                byt = bytes()
-                for i in range(5000):
-                    byt += strm.read(1024)
-                    b = byt.find(b'\xff\xd9')
-                    if b != -1:
-                        break
-                a = byt.find(b'\xff\xd8')
-                raw = cv2.imdecode(np.frombuffer(byt[a:b+2], dtype=np.uint8), -1)
-                self.im0 = np.array(Image.fromarray(raw).convert('F'), dtype=np.float32)
+                # strm = urllib.request.urlopen(self.target)
+                # byt = bytes()
+                # for i in range(5000):
+                #     byt += strm.read(1024)
+                #     b = byt.find(b'\xff\xd9')
+                #     if b != -1:
+                #         break
+                # a = byt.find(b'\xff\xd8')
+                # raw = cv2.imdecode(np.frombuffer(byt[a:b+2], dtype=np.uint8), -1)
+                # self.im0 = np.array(Image.fromarray(raw).convert('F'), dtype=np.float32)
+                # self.ysize, self.xsize = self.im0.shape
+                cap = cv2.VideoCapture(self.target)
+                ret, frame = cap.read()
+                self.im0 = np.array(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), dtype=np.float32)
                 self.ysize, self.xsize = self.im0.shape
-
+            elif root[0:6] == 'pva://':
+                self.im0 = np.float32(pva_ctxt.get(root.replace('pva://', '')))
+                self.ysize, self.xsize = self.im0.shape
             elif ext == '':
                 imgout = caget(root).astype(np.uint16).astype(np.float32)
                 if len(imgout) == 0:
@@ -524,10 +540,15 @@ class ApplicationWindow(QtWidgets.QMainWindow):
         tlbr1 = NavigationToolbar(canv1, self)
         tlbr1.setStyleSheet("background-color: white;")
 
-        self.cmave = QtWidgets.QCheckBox('Cumulative Average: n=0')
+        self.cmave = QtWidgets.QCheckBox('Cumulative Average: n=0, Max:')
+        #cmmax_txt = QtWidgets.QLabel(', Max:')
+        self.cmmax = QtWidgets.QSpinBox()
+        self.cmmax.setValue(5)
         tvbar = QtWidgets.QHBoxLayout()
         tvbar.addStretch()
         tvbar.addWidget(self.cmave)
+        #tvbar.addWidget(cmmax_txt)
+        tvbar.addWidget(self.cmmax)
 
         sldxy = self.init_sldxy()
         separator = QtWidgets.QFrame()
@@ -553,15 +574,18 @@ class ApplicationWindow(QtWidgets.QMainWindow):
         header.setSectionsClickable(True)
         header.setSectionsMovable(False)
         header.sectionClicked.connect(lambda i: self.copy_ptree(self.tmodel, i))
-        ##subtab.addWidget(tree)
 
         canv2 = FigureCanvas(Figure(tight_layout=True))
         canv2.setMinimumHeight(200)
         self.bx = canv2.figure.add_subplot(111)
         sldns = self.init_sldns()
-        ##subtab.addWidget(canv2)
         split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         split.addWidget(tree)
+        if extfunc is not None:
+            caput_button = QtWidgets.QPushButton('Push to PVs')
+            caput_button.setFixedHeight(30)
+            caput_button.clicked.connect(lambda: self.update_ptree(pushcall=True))
+            split.addWidget(caput_button)
         split.addWidget(canv2)
         split.setCollapsible(0, False)
         split.setCollapsible(1, False)
@@ -657,7 +681,10 @@ class ApplicationWindow(QtWidgets.QMainWindow):
 
     def update_status(self):
         self.ddate.setText('Data-date: ' + self.storage.imtime.strftime('%Y/%m/%d %H:%M:%S'))
-        self.cmave.setText('Cumulative Average: n=' + str(self.storage.cmcnt))
+        self.cmave.setText('Cumulative Average: n=' + str(self.storage.cmcnt) + ', Max:')
+        if self.storage.cmcnt >= self.cmmax.value():
+            self.cmave.setChecked(False)
+            self.live_stop()
 
     def set_cmave(self):
         self.storage.cmave = self.cmave.isChecked()
@@ -742,6 +769,10 @@ class ApplicationWindow(QtWidgets.QMainWindow):
                 self.storage.nfac   = d1['Norm. factor']
                 if 'Overflow handling' in d1:
                     self.storage.ovrf = d1['Overflow handling']
+                if 'Origin' in d1:
+                    self.storage.target_origin = d1['Origin']
+                else:
+                    self.storage.target_origin = None
                 if 'Call external function' in d1:
                     self.call_extfunc = d1['Call external function']
 
@@ -868,7 +899,7 @@ class ApplicationWindow(QtWidgets.QMainWindow):
     def get_keyname(self, opt = ''):
         base = os.path.split(self.storage.target)[1]
         name, _ = os.path.splitext(base)
-        key = name.replace(':image1', '').replace(':ArrayData', '').replace(':', '_')
+        key = name.replace('://', '_').replace(':image1', '').replace(':ArrayData', '').replace(':', '_')
         now = datetime.now()
         key += opt
         key += now.strftime('_%Y%m%d_%H%M%S')
@@ -1095,8 +1126,7 @@ class ApplicationWindow(QtWidgets.QMainWindow):
         self.sldt = QtWidgets.QSlider(QtCore.Qt.Horizontal, self)
         self.sldt.setRange(0, 2**16)
         self.sldt.setValue(self.def_thrs)
-        self.sldt.sliderReleased.connect(lambda: self.sldns_changed('t', False))
-        #self.sldt.valueChanged.connect(lambda: self.sldns_changed('t', False))
+        self.sldt.sliderReleased.connect(lambda: self.sldns_changed('t'))
 
         row2 = QtWidgets.QHBoxLayout()
         txt2 = QtWidgets.QLabel('Background: ')
@@ -1109,8 +1139,7 @@ class ApplicationWindow(QtWidgets.QMainWindow):
         self.sldb = QtWidgets.QSlider(QtCore.Qt.Horizontal, self)
         self.sldb.setRange(0, 2**16)
         self.sldb.setValue(self.def_bkgr)
-        self.sldb.sliderReleased.connect(lambda: self.sldns_changed('b', False))
-        #self.sldb.valueChanged.connect(lambda: self.sldns_changed('b', False))
+        self.sldb.sliderReleased.connect(lambda: self.sldns_changed('b'))
 
         col.addLayout(row1)
         col.addWidget(self.sldt)
@@ -1162,7 +1191,10 @@ class ApplicationWindow(QtWidgets.QMainWindow):
         tree.setAlternatingRowColors(True)
         return tree, tmodel
 
-    def update_ptree(self):
+    def update_ptree(self, pushcall=False):
+        if not hasattr(self.storage, 'im0'):
+            return None
+
         self.tmodel.removeRows(0, self.tmodel.rowCount())
         root = self.tmodel.invisibleRootItem()
 
@@ -1186,12 +1218,24 @@ class ApplicationWindow(QtWidgets.QMainWindow):
         root.appendRow([qi('Background RMS'), qi(value), qi('(est.)')])
 
         d['Total count'] = self.ima.total
-        if self.call_extfunc and extfunc is not None:
+        if (self.call_extfunc or pushcall) and extfunc is not None:
             def call_extfunc_status(f):
-                self.call_extfunc = f.result()
+                if f.result() is False:
+                    self.call_extfunc = False
 
-            job = self.tpool.submit(extfunc, name=self.storage.target, info=d)
-            job.add_done_callback(call_extfunc_status)
+            _, ext = os.path.splitext(self.storage.target)
+            name = None
+
+            if ext == '':
+                name = self.storage.target
+            elif self.storage.target_origin is not None:
+                _, ext2 = os.path.splitext(self.storage.target_origin)
+                if ext2 == '':
+                    name = self.storage.target_origin
+
+            if name is not None:
+                job = self.tpool.submit(extfunc, name=name, info=d)
+                job.add_done_callback(call_extfunc_status)
 
         self.dump[-1] = self.ima.total
 
@@ -1235,7 +1279,7 @@ class ApplicationWindow(QtWidgets.QMainWindow):
             self.ima.plot_main(self.ax, 2, rescale=self.ckrsc.isChecked())
             self.ax.figure.canvas.draw_idle()
 
-    def sldns_changed(self, src, released):
+    def sldns_changed(self, src):
         valt = self.sldt.value()
         valb = self.sldb.value()
         if valt < valb:
@@ -1247,12 +1291,7 @@ class ApplicationWindow(QtWidgets.QMainWindow):
                 self.sldb.setValue(valb)
         self.valt.setText('{}'.format(valt))
         self.valb.setText('{}'.format(valb))
-        opt = False
-        if released and self.liveview :
-            opt = True
-        elif not released and not self.liveview:
-            opt = True
-        if not self.new and opt:
+        if not self.new and not self.liveview:
             self.update(1)
 
     def valns_changed(self, src):
@@ -1267,6 +1306,9 @@ class ApplicationWindow(QtWidgets.QMainWindow):
                 self.valb.setText('{}'.format(int(valb)))
         self.sldt.setValue(valt)
         self.sldb.setValue(valb)
+
+        if not self.new and not self.liveview:
+            self.update(1)
 
     def nsmask_changed(self):
         if not self.new:
@@ -1417,9 +1459,9 @@ class ApplicationWindow(QtWidgets.QMainWindow):
 
         def size_changed():
             if txpx.text() in ['', '0']:
-                txpx.setText('{}'.format(self.storage.xsize))
+                txpx.setText('{}'.format(int(self.storage.xsize)))
             if typx.text() in ['', '0']:
-                typx.setText('{}'.format(self.storage.ysize))
+                typx.setText('{}'.format(int(self.storage.ysize)))
 
             self.storage.xsize = int(txpx.text())
             self.storage.ysize = int(typx.text())
@@ -1868,7 +1910,7 @@ class ApplicationWindow(QtWidgets.QMainWindow):
             if self.rselect.active:
                 self.rselect.update()
 
-        if mpl.__version__ < '3.5':
+        if parse(mpl.__version__) < parse('3.5'):
             self.rselect = RectangleSelector(dx, selected, drawtype='box',
                 useblit=False, button=[1], interactive=True, maxdist=20,
                 rectprops={'fill':False, 'edgecolor':ima.lclr[4], 'alpha':1, 'lw':4, 'ls':':'})
@@ -2286,6 +2328,8 @@ if __name__ == "__main__":
         app.bkg_dir = ptmp.absolute()
     if args.size is not None:
         app.resize(*args.size)
+    else:
+        app.resize(1150, 800)
 
     logging.info('Viola: version {}'.format(__version__))
     qapp.exec_()
